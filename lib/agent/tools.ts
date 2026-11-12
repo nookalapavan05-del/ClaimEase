@@ -2,82 +2,180 @@ import "server-only";
 import { z } from "zod";
 import { defineTool, type AgentTool } from "./defineTool";
 import { getSupabase } from "../supabase";
-import { isoDate } from "../schemas";
+import { CURRENT_USER_ID } from "../currentUser";
+import { todayInIndia } from "../dates";
 
-/*
- * EXAMPLE TOOLS for the starter "tasks" table (seed/00_starter_example.sql).
- * They show the pattern: 1 read tool + 2 write tools.
- *
- * YOUR JOB: replace these with tools for your problem statement.
- * Tips:
- *  - Write the description as "Use this when ..." so Gemini knows WHEN to call it.
- *  - Describe every field, including its format (for example YYYY-MM-DD).
- *  - Return small, clean objects. Gemini reads what you return.
- *  - Throw an Error with a clear message when something is wrong. The agent will explain it.
- */
+function dateToUtcDay(value: string): Date {
+  const [year, month, day] = value.split("-").map(Number);
+  const date = new Date(0);
+  date.setUTCHours(0, 0, 0, 0);
+  date.setUTCFullYear(year, month - 1, day);
+  return date;
+}
 
-const listTasks = defineTool({
-  name: "listTasks",
+function isRealIsoDate(value: string): boolean {
+  const [year, month, day] = value.split("-").map(Number);
+  if (year < 1) return false;
+  const date = dateToUtcDay(value);
+  return (
+    date.getUTCFullYear() === year &&
+    date.getUTCMonth() === month - 1 &&
+    date.getUTCDate() === day
+  );
+}
+
+const getEmployee = defineTool({
+  name: "getEmployee",
+  description: "Use this when the user asks about their employee profile.",
+  schema: z.object({}),
+  run: async () => {
+    const { data, error } = await getSupabase()
+      .from("employees")
+      .select("id, name, email, grade, department, manager_name, base_city")
+      .eq("id", CURRENT_USER_ID)
+      .maybeSingle();
+    if (error) throw new Error(error.message);
+    if (!data) throw new Error(`No employee found with id ${CURRENT_USER_ID}`);
+    return data;
+  },
+});
+
+const listClaims = defineTool({
+  name: "listClaims",
   description:
-    "Use this when the user wants to see their tasks. Can filter by status. Returns at most 20 tasks, newest first.",
+    "Use this when the user wants to see their expense claims. Can filter by status. Returns at most 20 claims, newest first.",
   schema: z.object({
     status: z
-      .enum(["open", "done", "all"])
+      .enum(["submitted", "flagged", "approved", "rejected", "paid"])
       .optional()
-      .describe("Which tasks to return. Default is all."),
+      .describe("Which claim status to return. Omit to include all statuses."),
   }),
   run: async ({ status }) => {
     let query = getSupabase()
-      .from("tasks")
-      .select("id, title, due_date, status")
+      .from("claims")
+      .select(
+        "id, category, amount, expense_date, description, has_receipt, status, policy_check, created_at"
+      )
+      .eq("employee_id", CURRENT_USER_ID)
       .order("created_at", { ascending: false })
       .limit(20);
-    if (status && status !== "all") query = query.eq("status", status);
+    if (status) query = query.eq("status", status);
     const { data, error } = await query;
     if (error) throw new Error(error.message);
-    return { count: data.length, tasks: data };
+    return { count: data.length, claims: data };
   },
 });
 
-const createTask = defineTool({
-  name: "createTask",
-  description: "Use this when the user asks to add, create or remember a new task.",
+const getPolicyRules = defineTool({
+  name: "getPolicyRules",
+  description: "Use this when the user asks about expense policies for their employee grade.",
+  schema: z.object({}),
+  run: async () => {
+    const { data: employee, error: employeeError } = await getSupabase()
+      .from("employees")
+      .select("grade")
+      .eq("id", CURRENT_USER_ID)
+      .maybeSingle();
+    if (employeeError) throw new Error(employeeError.message);
+    if (!employee) throw new Error(`No employee found with id ${CURRENT_USER_ID}`);
+
+    const { data: policyRules, error: policyRulesError } = await getSupabase()
+      .from("policy_rules")
+      .select("category, grade, max_amount, receipt_required_above, notes")
+      .eq("grade", employee.grade)
+      .order("category", { ascending: true });
+    if (policyRulesError) throw new Error(policyRulesError.message);
+    return { grade: employee.grade, policyRules };
+  },
+});
+
+const submitClaim = defineTool({
+  name: "submitClaim",
+  description: "Use this when the user wants to submit an expense claim.",
   writes: true,
   schema: z.object({
-    title: z.string().trim().min(1).max(200).describe("Short title of the task"),
-    due_date: isoDate.optional().describe("Due date in YYYY-MM-DD format, if the user gave one"),
+    category: z.enum([
+      "local_travel",
+      "outstation_travel",
+      "hotel_metro",
+      "hotel_non_metro",
+      "meals",
+      "client_entertainment",
+      "internet",
+      "mobile",
+      "training",
+    ]),
+    amount: z.number().positive().describe("Claim amount in rupees"),
+    expense_date: z
+      .string()
+      .regex(/^\d{4}-\d{2}-\d{2}$/, "Use YYYY-MM-DD format"),
+    description: z.string().trim().min(1).describe("Description of the expense"),
+    has_receipt: z.boolean().describe("Whether a receipt is available"),
   }),
-  run: async ({ title, due_date }) => {
+  run: async ({ category, amount, expense_date, description, has_receipt }) => {
+    if (!isRealIsoDate(expense_date)) {
+      throw new Error("Expense date must be a real date in YYYY-MM-DD format");
+    }
+    const expenseDay = dateToUtcDay(expense_date).getTime();
+    const today = dateToUtcDay(todayInIndia()).getTime();
+    const dayInMilliseconds = 24 * 60 * 60 * 1000;
+    if (expenseDay > today) throw new Error("Expense date cannot be in the future");
+    if (today - expenseDay > 60 * dayInMilliseconds) {
+      throw new Error("Expense date cannot be more than 60 days ago");
+    }
+
+    const { data: employee, error: employeeError } = await getSupabase()
+      .from("employees")
+      .select("grade")
+      .eq("id", CURRENT_USER_ID)
+      .maybeSingle();
+    if (employeeError) throw new Error(employeeError.message);
+    if (!employee) throw new Error(`No employee found with id ${CURRENT_USER_ID}`);
+
+    const { data: policy, error: policyError } = await getSupabase()
+      .from("policy_rules")
+      .select("max_amount, receipt_required_above")
+      .eq("grade", employee.grade)
+      .eq("category", category)
+      .maybeSingle();
+    if (policyError) throw new Error(policyError.message);
+    if (!policy) {
+      throw new Error(`No policy found for category ${category} and grade ${employee.grade}`);
+    }
+
+    const policyIssues: string[] = [];
+    if (amount > policy.max_amount) {
+      policyIssues.push(
+        `Amount ${amount} exceeds the maximum allowed amount of ${policy.max_amount}.`
+      );
+    }
+    if (amount > policy.receipt_required_above && !has_receipt) {
+      policyIssues.push(
+        `A receipt is required for amounts above ${policy.receipt_required_above}, but none was provided.`
+      );
+    }
+    const status = policyIssues.length > 0 ? "flagged" : "submitted";
+    const policy_check = policyIssues.length > 0 ? policyIssues.join(" ") : "Within policy";
+
     const { data, error } = await getSupabase()
-      .from("tasks")
-      .insert({ title, due_date: due_date ?? null })
-      .select("id, title, due_date, status")
+      .from("claims")
+      .insert({
+        employee_id: CURRENT_USER_ID,
+        category,
+        amount,
+        expense_date,
+        description,
+        has_receipt,
+        status,
+        policy_check,
+      })
+      .select(
+        "id, employee_id, category, amount, expense_date, description, has_receipt, status, policy_check, created_at"
+      )
       .single();
     if (error) throw new Error(error.message);
-    return { created: data };
+    return data;
   },
 });
 
-const completeTask = defineTool({
-  name: "completeTask",
-  description:
-    "Use this when the user says a task is finished. Needs the task id, so call listTasks first if you do not know it.",
-  writes: true,
-  schema: z.object({
-    id: z.number().int().positive().describe("The id of the task"),
-  }),
-  run: async ({ id }) => {
-    const { data, error } = await getSupabase()
-      .from("tasks")
-      .update({ status: "done" })
-      .eq("id", id)
-      .select("id, title, status")
-      .maybeSingle();
-    if (error) throw new Error(error.message);
-    if (!data) throw new Error(`No task found with id ${id}`);
-    return { updated: data };
-  },
-});
-
-/** Every tool in this list is given to Gemini. Add your own tools here. */
-export const tools: AgentTool[] = [listTasks, createTask, completeTask];
+export const tools: AgentTool[] = [getEmployee, listClaims, getPolicyRules, submitClaim];
