@@ -7,9 +7,9 @@ type Message = { role: "user" | "model"; text: string; steps?: AgentStep[] };
 
 // YOUR JOB: change these sample prompts to match your problem statement.
 const SAMPLE_PROMPTS = [
-  "Add a task to call the vendor tomorrow, then show all my tasks.",
-  "Which tasks are still open?",
-  "Mark the vendor call task as done.",
+  "Show my employee profile.",
+  "Show my recent expense claims.",
+  "Show my expense policy limits and receipt requirements.",
 ];
 
 export default function AgentChat({ onDataChanged }: { onDataChanged?: () => void }) {
